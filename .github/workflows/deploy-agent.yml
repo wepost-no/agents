@@ -51,9 +51,10 @@ on:
       harness-source:
         description: >-
           Which stored credential to use for the agent's harness: managed, byok,
-          oauth, or plan. Leave empty to use this workspace's default of "oauth"
-          (its Claude credential was connected with a setup token). Only set
-          this if that ever changes.
+          oauth, or plan. Leave empty to use the default of "managed"
+          (workforce-billed inference), which is what these personas expect.
+          Only set this for a persona that routes inference through your own
+          LLM subscription.
         required: false
         type: string
       dry-run:
@@ -91,16 +92,20 @@ jobs:
           # workflow that silently reads empty from the other place costs an
           # operator a failed deploy and a confused hour. `||` takes the first
           # non-empty, so both work and neither needs migrating.
-          # Defaults to `oauth` because this workspace's Claude credential was
-          # connected with a setup token (provider_credentials.auth_type =
-          # oauth_token). The CLI will not guess a source under --no-prompt, so
-          # without a default every deploy fails with "claude credentials are
-          # not connected" on a credential that is present and healthy.
+          # `managed` = workforce-billed inference, which is what this persona
+          # asks for: it does NOT set useSubscription, so inference is billed to
+          # the workforce rather than routed through this workspace's own LLM
+          # subscription. The managed leg mints a relay-managed provider
+          # credential directly and needs no credential from this workspace.
           #
-          # Still overridable: dispatch box wins, then the
-          # WORKFORCE_DEPLOY_HARNESS_SOURCE Environment variable, then this
-          # default. Change it if this workspace ever moves to managed or byok.
-          harness-source: ${{ inputs.harness-source || vars.WORKFORCE_DEPLOY_HARNESS_SOURCE || 'oauth' }}
+          # NOT `oauth`. That source is for useSubscription personas — it points
+          # at the workspace's own Claude setup token, and its preflight probe
+          # currently reports a connected credential as missing, so it fails the
+          # deploy even though the credential is healthy.
+          #
+          # Still overridable: dispatch box, then the
+          # WORKFORCE_DEPLOY_HARNESS_SOURCE Environment variable, then this.
+          harness-source: ${{ inputs.harness-source || vars.WORKFORCE_DEPLOY_HARNESS_SOURCE || 'managed' }}
           workspace-id: ${{ vars.WORKFORCE_WORKSPACE_ID || secrets.WORKFORCE_WORKSPACE_ID }}
           workspace-token: ${{ secrets.WORKFORCE_WORKSPACE_TOKEN }}
           # Stacked lowest-precedence first; the deploy script lets later lines
