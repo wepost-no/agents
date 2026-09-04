@@ -92,20 +92,17 @@ jobs:
           # workflow that silently reads empty from the other place costs an
           # operator a failed deploy and a confused hour. `||` takes the first
           # non-empty, so both work and neither needs migrating.
-          # `managed` = workforce-billed inference, which is what this persona
-          # asks for: it does NOT set useSubscription, so inference is billed to
-          # the workforce rather than routed through this workspace's own LLM
-          # subscription. The managed leg mints a relay-managed provider
-          # credential directly and needs no credential from this workspace.
+          # `oauth` = run on this workspace's own Claude subscription, via the
+          # setup token connected in Workspace Integrations. That matches the
+          # persona, which sets useSubscription: true.
           #
-          # NOT `oauth`. That source is for useSubscription personas — it points
-          # at the workspace's own Claude setup token, and its preflight probe
-          # currently reports a connected credential as missing, so it fails the
-          # deploy even though the credential is healthy.
+          # NOT `managed`: workforce-billed inference is not available to this
+          # workspace (the managed credential mint returns 403 Forbidden), and
+          # it would bill the wrong party besides.
           #
           # Still overridable: dispatch box, then the
           # WORKFORCE_DEPLOY_HARNESS_SOURCE Environment variable, then this.
-          harness-source: ${{ inputs.harness-source || vars.WORKFORCE_DEPLOY_HARNESS_SOURCE || 'managed' }}
+          harness-source: ${{ inputs.harness-source || vars.WORKFORCE_DEPLOY_HARNESS_SOURCE || 'oauth' }}
           workspace-id: ${{ vars.WORKFORCE_WORKSPACE_ID || secrets.WORKFORCE_WORKSPACE_ID }}
           workspace-token: ${{ secrets.WORKFORCE_WORKSPACE_TOKEN }}
           # Stacked lowest-precedence first; the deploy script lets later lines
