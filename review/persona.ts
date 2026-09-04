@@ -59,11 +59,17 @@ export default definePersona({
     }
   },
 
-  // No useSubscription: inference is workforce-billed (Claude per harness/model
-  // below). useSubscription:true would route through your own LLM provider, but
-  // the CLI deploy path doesn't supply a subscription resolver, so it can't deploy.
-  // The failure is misleading — the orchestrator reports "anthropic credentials
-  // are not connected" even for a workspace that HAS Anthropic connected.
+  // This agent runs on THIS workspace's own Claude subscription (the setup
+  // token connected in Workspace Integrations), not on workforce-billed
+  // tokens. That is what useSubscription selects.
+  //
+  // It was briefly removed to get past a deploy error. That was wrong: it
+  // silently moved inference billing off this workspace's subscription and
+  // left the connected setup token unused. Workforce-billed is also not
+  // available here — the managed path returns 403 Forbidden for this
+  // workspace, which is the correct answer for a subscription customer.
+  useSubscription: true,
+
   harness: 'claude',
   model: 'claude-opus-4-8',
   systemPrompt: 'You are a rigorous senior reviewer. Review PRs, auto-apply only lint/format/typo fixes, leave logic and safety changes as comments, keep CI honest, and only hand back when the PR is genuinely ready.',
