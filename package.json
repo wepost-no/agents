@@ -4,7 +4,7 @@
   "license": "Apache-2.0",
   "private": true,
   "type": "module",
-  "description": "A collection of proactive agents — showcase examples for Agent Workforce.",
+  "description": "A collection of proactive agents \u2014 showcase examples for Agent Workforce.",
   "scripts": {
     "test": "rm -rf .test-build && tsc --noEmit false --outDir .test-build && node --test tests/*.test.mjs; status=$?; rm -rf .test-build; exit $status",
     "test:review": "node scripts/test.mjs tests/review-agent.test.mjs",
@@ -19,26 +19,26 @@
     "evals:live": "npm run compile && node scripts/evals/run-evals.mjs --live --judge"
   },
   "dependencies": {
-    "@agentworkforce/compose": "4.1.43",
-    "@agentworkforce/delivery": "4.1.43",
-    "@agentworkforce/persona-kit": "4.1.43",
-    "@agentworkforce/runtime": "4.1.43",
+    "@agentworkforce/compose": "4.1.54",
+    "@agentworkforce/delivery": "4.1.54",
+    "@agentworkforce/persona-kit": "4.1.54",
+    "@agentworkforce/runtime": "4.1.54",
     "@relayfile/adapter-daytona": "^0.1.1",
     "@relayfile/relay-helpers": "0.4.11",
     "@relayflows/core": "^1.0.6"
   },
   "devDependencies": {
     "@types/node": "^22",
-    "agentworkforce": "4.1.43",
+    "agentworkforce": "4.1.54",
     "esbuild": "^0.25.12",
     "tsx": "^4.22.4",
     "typescript": "^5.6.0"
   },
   "overrides": {
-    "@agentworkforce/deploy": "4.1.43",
-    "@agentworkforce/local-surface": "4.1.43",
-    "@agentworkforce/persona-kit": "4.1.43",
-    "@agentworkforce/runtime": "4.1.43",
+    "@agentworkforce/deploy": "4.1.54",
+    "@agentworkforce/local-surface": "4.1.54",
+    "@agentworkforce/persona-kit": "4.1.54",
+    "@agentworkforce/runtime": "4.1.54",
     "@relayfile/adapter-linear": "0.4.12",
     "@opentelemetry/otlp-transformer": {
       "protobufjs": "^8.5.0"
