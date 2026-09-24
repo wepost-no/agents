@@ -12,6 +12,11 @@
  * harness runs. The agent may leave only mechanical fixes there; cloud commits
  * and pushes those edits after the harness exits — no git/gh in the harness.
  *
+ * Review comment: rendered by code from the json report the harness ends its
+ * reply with (see renderReview) — a P0/P1/P2 verdict heading, then each finding
+ * as a permalink GitHub shows as a code snippet. A run that fails, or whose
+ * commit was replaced by a newer push while it ran, posts nothing.
+ *
  * Ready signal: the review comment says the PR is a human's turn only when it
  * genuinely is — checks green, every bot/reviewer comment resolved, nothing left
  * for the agent to fix (the agent's READY sentinel).
@@ -26,6 +31,7 @@ import {
   type WorkforceCtx
 } from '@agentworkforce/runtime';
 import { githubClient } from '@relayfile/relay-helpers';
+import { parseReviewReport, renderReview } from './lib/review-comment.js';
 
 export interface Pr {
   owner: string;
@@ -451,35 +457,11 @@ export function logHarnessFailureDiagnostics(
   });
 }
 
-/**
- * Give up on a run the OS killed twice.
- *
- * Deliberately NOT failReviewRun: that tells the PR author "this needs operator
- * attention", which reads as though something in their PR needs fixing and
- * leaves them asking whether the problem is on their side. An OOM is not.
- */
-async function abandonReviewRunToInfraKill(
-  ctx: WorkforceCtx,
-  pr: Pr,
-  exitCode: number
-): Promise<never> {
-  const message = [
-    `pr-reviewer could not review #${pr.number} — the review sandbox ran out of resources (exit ${exitCode}).`,
-    '',
-    'This is an infrastructure limit, not a problem with this PR, and there is nothing to fix here. The review runs again on the next push.',
-  ].join('\n');
-  ctx.log?.('error', 'pr-reviewer harness killed by infrastructure', {
-    owner: pr.owner,
-    repo: pr.repo,
-    number: pr.number,
-    exitCode,
-    retried: true,
-  });
-  await githubClient().comment({ owner: pr.owner, repo: pr.repo, number: pr.number }, message);
-  throw new Error(message);
-}
-
 async function reviewAndFix(ctx: WorkforceCtx, pr: Pr): Promise<void> {
+  // The commit this pass reviews: its findings link to code at this SHA, and a
+  // push that lands while the pass runs makes the review stale (checked below).
+  const startHead = await currentHeadSha(pr);
+  const reviewedSha = pr.headSha ?? startHead;
   const { run, exitCode, infraKill } = await runReviewHarnessWithRetry(
     () => ctx.harness.run({
       cwd: ctx.sandbox.cwd,
@@ -499,29 +481,73 @@ async function reviewAndFix(ctx: WorkforceCtx, pr: Pr): Promise<void> {
   );
 
   if (infraKill) {
-    await abandonReviewRunToInfraKill(ctx, pr, exitCode as number);
+    return failReviewRun(ctx, pr, `The review sandbox ran out of resources (exit ${exitCode}) twice.`);
   }
-  if (exitCode !== null && exitCode !== 0) {
-    await failReviewRun(ctx, pr, `The review harness exited with code ${exitCode}.`);
+  if (exitCode) {
+    return failReviewRun(ctx, pr, `The review harness exited with code ${exitCode}.`);
   }
 
-  // The harness only writes a review when we explicitly post it. Strip the
-  // READY sentinel (it's the ready signal, not a review-body line) and post
-  // whatever's left as a PR comment via the github VFS.
+  // Strip the READY sentinel (the ready signal, not part of the review), then
+  // read the json report the prompt asks the harness to end with.
   const raw = (run.output ?? '').trimEnd();
+  if (!raw) {
+    return failReviewRun(ctx, pr, 'The review harness produced no review output.');
+  }
   const harnessReady = lastLine(raw) === 'READY';
-  const review = harnessReady ? stripLastLine(raw).trimEnd() : raw;
-  if (!review) {
-    await failReviewRun(ctx, pr, 'The review harness produced no review output.');
+  const report = parseReviewReport(harnessReady ? stripLastLine(raw) : raw);
+  if (!report) {
+    // Output without a report is narration ("waiting for the typecheck…"), not
+    // a review. Logged, not thrown: a retry reruns the same prompt, and the next
+    // push reviews afresh anyway.
+    ctx.log?.('error', 'pr-reviewer harness output had no review report', {
+      owner: pr.owner,
+      repo: pr.repo,
+      number: pr.number,
+      outputTail: harnessOutputTail(raw),
+    });
+    return;
   }
-  if (review) {
-    // Only call it a human's turn when it actually is: checks green, all
-    // bot/reviewer comments resolved, nothing left for the agent to fix (the
-    // READY sentinel). Every in-progress pass posts the review on its own.
-    const ready = harnessReady && await verifyReadyForHumanReview(ctx, pr);
-    const body = ready ? `${review}\n\n:white_check_mark: This PR is ready for your review.` : review;
-    await githubClient().comment({ owner: pr.owner, repo: pr.repo, number: pr.number }, body);
-  }
+
+  if (await supersededByPush(ctx, pr, [pr.headSha, startHead])) return;
+
+  // Only call it a human's turn when it actually is: checks green, all
+  // bot/reviewer comments resolved, nothing left for the agent to fix (the
+  // READY sentinel). Every in-progress pass posts the review on its own.
+  const ready = harnessReady && await verifyReadyForHumanReview(ctx, pr);
+  const body = renderReview(report, { owner: pr.owner, repo: pr.repo, sha: reviewedSha }, ready);
+  await githubClient().comment({ owner: pr.owner, repo: pr.repo, number: pr.number }, body);
+}
+
+/**
+ * Whether a push landed while this pass ran: the PR head now matches none of
+ * the heads the pass started from (the one the event named, and the one the
+ * VFS projected at the start). Then it reviewed old code, and that push started
+ * its own pass over the new head — posting both is how a PR got a "blocking"
+ * finding ten minutes after its author had pushed the fix. Matching either head
+ * keeps a projection that lags the event, or never updates, from dropping a
+ * review of the current code; with no head to compare, the review posts.
+ */
+export async function supersededByPush(
+  ctx: WorkforceCtx,
+  pr: Pr,
+  startHeads: Array<string | undefined>,
+): Promise<boolean> {
+  const known = startHeads.filter((sha): sha is string => Boolean(sha));
+  const headSha = await currentHeadSha(pr);
+  if (!headSha || known.length === 0 || known.includes(headSha)) return false;
+  ctx.log?.('info', 'pr-reviewer review superseded by a newer push', {
+    owner: pr.owner,
+    repo: pr.repo,
+    number: pr.number,
+    startHeads: known,
+    headSha,
+  });
+  return true;
+}
+
+/** The PR's head commit as the GitHub VFS projects it right now. */
+async function currentHeadSha(pr: Pr): Promise<string | undefined> {
+  return readMetaHeadSha(await loadPrMeta(pr));
 }
 
 // ── conflict resolution (opt-in, comment-driven) ────────────────────────────
@@ -538,16 +564,26 @@ async function resolveConflicts(ctx: WorkforceCtx, pr: Pr): Promise<void> {
 
   const exitCode = (run as { exitCode?: unknown }).exitCode;
   if (typeof exitCode === 'number' && exitCode !== 0) {
-    await failReviewRun(ctx, pr, `The conflict-resolution harness exited with code ${exitCode}.`);
+    await failConflictRun(ctx, pr, `The conflict-resolution harness exited with code ${exitCode}.`);
   }
 
   const body = (run.output ?? '').trim();
   if (!body) {
-    await failReviewRun(ctx, pr, 'The conflict-resolution harness produced no output.');
+    await failConflictRun(ctx, pr, 'The conflict-resolution harness produced no output.');
   }
   if (body) {
     await githubClient().comment({ owner: pr.owner, repo: pr.repo, number: pr.number }, body);
   }
+}
+
+/** Someone asked for this by comment, so unlike a review, its failure is
+ *  answered on the PR — silence would leave them waiting. */
+async function failConflictRun(ctx: WorkforceCtx, pr: Pr, reason: string): Promise<never> {
+  await githubClient().comment(
+    { owner: pr.owner, repo: pr.repo, number: pr.number },
+    `pr-reviewer could not resolve the conflicts on #${pr.number}. ${reason}`,
+  );
+  return failReviewRun(ctx, pr, reason);
 }
 
 export function reviewHarnessPrompt(pr: { owner: string; repo: string; number: number }): string {
@@ -558,7 +594,7 @@ export function reviewHarnessPrompt(pr: { owner: string; repo: string; number: n
     `Flag and fix breakage even when the affected file is outside the changed-file set, but do not do an unrelated full-repo audit.`,
     `Auto-edit only lint, formatting, spelling, typo, import-order, or other mechanical non-semantic changes.`,
     `Do not auto-edit semantic or safety-critical logic. For behavior changes, architecture changes, and any reviewer`,
-    `request that needs human judgment, leave a clear suggestion or review comment instead of changing files.`,
+    `request that needs human judgment, report a finding instead of changing files.`,
     `If the PR already has a human review or approval, switch to suggestion/comment-only for everything except`,
     `obvious mechanical cleanup that cannot change runtime behavior.`,
     `Resolve failing CI checks by editing the code only when the fix is mechanical and non-semantic. Don't use git or the gh CLI; cloud commits`,
@@ -571,27 +607,19 @@ export function reviewHarnessPrompt(pr: { owner: string; repo: string; number: n
     `Never change semantic or safety defaults: do not turn fail-closed states into fail-open states such as`,
     `"timeout", "pending", throw, or undefined becoming "acked", true, {}, or another success/default path; do not`,
     `swap truthiness checks for presence checks; do not edit guard default values. If a reviewer asks for one of`,
-    `these changes, explain the risk in your review and leave the code unchanged.`,
+    `these changes, leave the code unchanged.`,
     `Never touch lifecycle, termination, reaper, in-flight, dispatch, broker ownership, or process-cleanup code. Those`,
-    `areas are safety-critical; raise findings as comments for a human-authored patch instead.`,
+    `areas are safety-critical; report findings there for a human-authored patch instead.`,
     `Stay within this PR's purpose (.workforce/pr.diff is the change; use .workforce/context.json for available PR`,
-    `metadata). A reviewer suggestion that changes files or behavior unrelated to`,
-    `that purpose — refactoring a module`,
+    `metadata). A reviewer suggestion that changes files or behavior unrelated to that purpose — refactoring a module`,
     `the PR doesn't touch, renaming resources in an adapter the PR never edits, a cross-cutting "while you're here"`,
-    `cleanup — does NOT belong in this PR: record it as an advisory note under a "## Advisory Notes" heading in your review and leave the code unchanged.`,
+    `cleanup — does NOT belong in this PR: leave the code unchanged and leave it out of your report.`,
     `Folding an unrelated change into the PR is how you break an unrelated package's build; when in doubt, scope out.`,
-    `Account for every bot and reviewer comment explicitly in your output under an "## Addressed comments" heading:`,
-    `one bullet per comment naming the bot/reviewer and what they raised, followed by either the file:line where you`,
-    `fixed it (e.g. "fixed in src/foo.ts:42") or, if you did not change anything, a one-line reason (stale —`,
-    `already handled by a later commit, or invalid because <reason>). This is how the comment authors and the human`,
-    `see that each thread was handled and exactly where, so be specific with the path and line; do not say a comment`,
-    `was addressed without pointing to the fix.`,
+    `When .workforce/context.json carries comments from other reviewers or bots, treat each like a finding of your`,
+    `own: fix it when it is mechanical, report it when it is real and unfixed, and drop it when it is stale or wrong.`,
     `Verify every edit before you finish, and verify it the way CI does — not just the unit test next to the file.`,
     `Run the repo's canonical build and test command end to end (read package.json / turbo.json / the CI workflow to`,
     `find what CI actually runs, focusing only on build/test/typecheck steps; install dependencies if needed) so you catch breakage DOWNSTREAM of the file you`,
-    `The sandbox is memory-constrained, so run those steps SERIALLY: do not raise worker/concurrency counts, and`,
-    `prefer a tool's single-worker flag (e.g. --maxWorkers=1, --concurrency=1) when it has one. A build or test run`,
-    `that is killed outright verifies nothing, so a slower serial run is strictly better than a parallel one that dies.`,
     `edited. In a monorepo, editing one source file can break a generated/committed artifact (a catalog, lockfile,`,
     `snapshot, or generated types) or a different package that imports it: when a finding makes you touch a source`,
     `that feeds a generated file, regenerate that file with the repo's own generator and rebuild the packages that`,
@@ -599,25 +627,80 @@ export function reviewHarnessPrompt(pr: { owner: string; repo: string; number: n
     `ships — the working tree must pass the full command with your edits in place. When you change code that`,
     `GENERATES commands, scripts, or queries, also execute a sample of the generated output against a throwaway`,
     `fixture — tests that only assert on the generated string prove nothing about its behavior.`,
+    `The sandbox is memory-constrained, so run those steps SERIALLY: do not raise worker/concurrency counts, and`,
+    `prefer a tool's single-worker flag (e.g. --maxWorkers=1, --concurrency=1) when it has one. A build or test run`,
+    `that is killed outright verifies nothing, so a slower serial run is strictly better than a parallel one that dies.`,
+    `If a step cannot finish here (it is killed or runs out of memory), record that once in "checks" and move on; do`,
+    `not retry it under other limits. Run every command in the foreground and wait for it: never background a`,
+    `command or schedule a wake-up, because the moment you stop, your last message is taken as the review.`,
     `Never add or modify tests to make your own change pass. If a change needs a new or updated test, that is a`,
-    `human decision; describe the needed test in your review and leave the working tree unchanged.`,
+    `human decision; report the missing test as a finding and leave the working tree unchanged.`,
     `Never make a check pass by weakening the test: do not delete it, skip it, loosen an assertion, narrow its`,
     `inputs, or replace a real assertion with a trivially-true one. A test that no longer fails when the behavior it`,
     `guards regresses is worse than no test, and it passes CI while hiding the bug. When an edit makes a test fail,`,
     `fix the CODE; only change a test's EXPECTATION when the test encoded the OLD, now-intentionally-changed contract`,
-    `and the new expected value is demonstrably correct — and say which in your "## Addressed comments" notes. If you`,
-    `cannot make a test genuinely pass, leave the code unfixed and raise it as advisory rather than gutting the test.`,
+    `and the new expected value is demonstrably correct — and say so in that edit's "fixes" line. If you`,
+    `cannot make a test genuinely pass, leave the code unfixed and report it as a finding rather than gutting the test.`,
     `If you cannot verify an edit (tests cannot run in this sandbox and you cannot make them run), do not leave it`,
     `in the working tree: discard it with "git restore <file>" — the one exception to the no-git rule, because`,
-    `rewriting a file back from memory is error-prone — delete files you created, and present the proposed change as`,
-    `advisory text in your review instead. Anything left in the working tree is committed and pushed to the PR after`,
+    `rewriting a file back from memory is error-prone — delete files you created, and report the proposed change as`,
+    `a finding instead. Anything left in the working tree is committed and pushed to the PR after`,
     `you exit — an unverified push is worse than no push.`,
-    `Only end your output with READY on its own last line when the PR genuinely needs a human now — meaning you have`,
+    ...reviewReportContract(),
+    `After the block, end with READY on its own last line only when the PR genuinely needs a human now — meaning you have`,
     `resolved or addressed every bot and reviewer comment, every required CI check has completed (none are pending`,
     `or in-progress) and all are passing, the PR has no merge conflicts (GitHub reports it as mergeable), and the`,
     `remaining decision requires human judgment. If any check is still pending, in-progress, or failed, or if the PR`,
     `has merge conflicts, do NOT print READY.`
   ].join('\n');
+}
+
+/**
+ * What to report and the one shape to report it in. parseReviewReport reads
+ * exactly this block and renderReview turns it into the PR comment; the P0-P2
+ * bar is the one Codex's reviews use on the same PRs, so both read alike.
+ */
+function reviewReportContract(): string[] {
+  return [
+    `WHAT TO REPORT: problems this PR introduces that its author would want to fix before merging. A finding must be`,
+    `discrete and actionable, and provable from the code: name the input or state that triggers it and, when it`,
+    `breaks other code, the file:line that is affected. Do not report style, naming or formatting (fix mechanical`,
+    `ones yourself), speculation ("this might…"), problems the PR did not introduce, or changes that are clearly`,
+    `intended. Give each finding a priority:`,
+    `P0: must fix before merge. It breaks the build or a test, crashes or corrupts data on a common path, or opens a`,
+    `security hole, and it does so for ordinary input.`,
+    `P1: should fix before merge. A real bug in a realistic scenario: a wrong result, lost or duplicated data, a path`,
+    `users will hit.`,
+    `P2: worth fixing, not blocking. A bug that needs unusual input or timing, or a concrete performance or`,
+    `maintenance hazard.`,
+    `Report at most 5 findings, most severe first. No findings is a good review; never pad the list.`,
+    `OUTPUT: your last message becomes the PR comment, rendered by code from one fenced json block. Anything else in`,
+    `it (except the READY line below) is dropped, so do not summarize the PR, narrate what you did, or add notes or`,
+    `disclaimers. End your last message with the block, in exactly this shape:`,
+    '```json',
+    '{',
+    '  "findings": [',
+    '    {',
+    '      "priority": "P1",',
+    '      "title": "Charge once when the webhook races the retry",',
+    '      "path": "src/billing/invoice.ts",',
+    '      "line": 88,',
+    '      "endLine": 94,',
+    '      "body": "When the payment webhook lands before the retry releases its lock, both paths call `chargeCustomer`, so the customer is billed twice. Take the lock before reading the invoice state, or make `chargeCustomer` idempotent on the invoice id."',
+    '    }',
+    '  ],',
+    '  "fixes": ["prettier: src/billing/invoice.ts"],',
+    '  "checks": ["jest src/billing: 42 passed", "tsc full typecheck: not run (sandbox memory limit)"]',
+    '}',
+    '```',
+    `title: one line, at most 80 characters, naming the problem or its fix.`,
+    `path, line, endLine: the repo-relative path and 1-based line range in the checked-out PR head that shows the`,
+    `problem, at most about 15 lines. Leave them out for a finding with no single location.`,
+    `body: one paragraph of at most 80 words, matter-of-fact: what triggers it, what goes wrong, and the fix. Inline`,
+    `code is fine; no headings, lists, praise or hedging.`,
+    `fixes: one line per mechanical edit you left in the working tree; [] when there are none.`,
+    `checks: one line per verification step you ran or could not run, with its result; at most 6.`,
+  ];
 }
 
 export function conflictResolveHarnessPrompt(pr: { owner: string; repo: string; number: number }): string {
@@ -1060,20 +1143,20 @@ function describeNotReadyState(state: PullRequestReadyState): string {
   return `check=${String(name)} state=${String(stateText)} conclusion=${String(conclusionText)}`;
 }
 
+/**
+ * End a run that produced no review — logged, never posted. The throw makes the
+ * runtime retry the run with backoff, and while every attempt also commented, a
+ * single PR collected 213 "could not complete review" notices. Operator errors
+ * belong in the logs; the PR only ever gets a review.
+ */
 async function failReviewRun(ctx: WorkforceCtx, pr: Pr, reason: string): Promise<never> {
-  const message = [
-    `pr-reviewer could not complete review for #${pr.number} in ${pr.owner}/${pr.repo}.`,
-    reason,
-    'No review was posted; this needs operator attention.',
-  ].join('\n');
   ctx.log?.('error', 'pr-reviewer harness failed', {
     owner: pr.owner,
     repo: pr.repo,
     number: pr.number,
     reason,
   });
-  await githubClient().comment({ owner: pr.owner, repo: pr.repo, number: pr.number }, message);
-  throw new Error(message);
+  throw new Error(`pr-reviewer could not complete review for #${pr.number} in ${pr.owner}/${pr.repo}. ${reason}`);
 }
 
 async function mergePr(ctx: WorkforceCtx, pr: Pr): Promise<void> {

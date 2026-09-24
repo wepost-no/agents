@@ -1,4 +1,7 @@
 import assert from 'node:assert/strict';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import test from 'node:test';
 
 import {
@@ -22,7 +25,9 @@ import {
   reviewHarnessPrompt,
   reviewAuthorAllowlistDecision,
   rollupFromCheckSummary,
+  supersededByPush,
 } from '../.test-build/review/agent.js';
+import { parseReviewReport, renderReview } from '../.test-build/review/lib/review-comment.js';
 
 function conflictCtx({ approvers, reviewAuthors } = {}) {
   return {
@@ -391,7 +396,7 @@ test('reviewHarnessPrompt keeps fixes within the PR scope and verifies CI-deep',
   // unrelated build in agents#162's downstream relayfile-adapters PR).
   assert.match(prompt, /Stay within this PR's purpose/);
   assert.match(prompt, /use \.workforce\/context\.json for available PR\s+metadata/);
-  assert.match(prompt, /record it as an advisory note under a "## Advisory Notes" heading in your review and leave the code unchanged/);
+  assert.match(prompt, /does NOT belong in this PR: leave the code unchanged and leave it out of your report/);
   // Verification must be CI-deep (full build/test), not just the touched file,
   // and must regenerate generated/committed artifacts the edit feeds.
   assert.match(prompt, /verify it the way CI does/);
@@ -408,7 +413,7 @@ test('reviewHarnessPrompt limits auto-edits to mechanical changes', () => {
   const prompt = reviewHarnessPrompt({ owner: 'AgentWorkforce', repo: 'agents', number: 266 });
   assert.match(prompt, /Auto-edit only lint, formatting, spelling, typo, import-order, or other mechanical non-semantic changes/);
   assert.match(prompt, /Do not auto-edit semantic or safety-critical logic/);
-  assert.match(prompt, /leave a clear suggestion or review comment instead of changing files/);
+  assert.match(prompt, /report a finding instead of changing files/);
   assert.match(prompt, /PR already has a human review or approval/);
   assert.match(prompt, /suggestion\/comment-only/);
 });
@@ -427,7 +432,7 @@ test('reviewHarnessPrompt forbids self-justifying test edits', () => {
   const prompt = reviewHarnessPrompt({ owner: 'AgentWorkforce', repo: 'agents', number: 243 });
   assert.match(prompt, /Never add or modify tests to make your own change pass/);
   assert.match(prompt, /If a change needs a new or updated test, that is a\s+human decision/);
-  assert.match(prompt, /describe the needed test in your review and leave the working tree unchanged/);
+  assert.match(prompt, /report the missing test as a finding and leave the working tree unchanged/);
 });
 
 test('reviewHarnessPrompt only allows READY after checks complete, pass, and the PR is mergeable', () => {
@@ -521,11 +526,14 @@ test('prReadyStateAllowsHumanReview holds back drafts and changes-requested PRs'
   }), false);
 });
 
-test('reviewHarnessPrompt requires accounting for each bot/reviewer comment with a location', () => {
+test('reviewHarnessPrompt folds other reviewers\' comments into its own findings', () => {
   const prompt = reviewHarnessPrompt({ owner: 'AgentWorkforce', repo: 'agents', number: 7 });
-  assert.match(prompt, /## Addressed comments/);
-  assert.match(prompt, /file:line where you/);
-  assert.match(prompt, /do not say a comment\s+was addressed without pointing to the fix/);
+  // The cloud context carries no review threads, so a mandatory "## Addressed
+  // comments" section came back empty on 34 of 45 wepost-saga reviews. A real
+  // comment is now a finding like any other; a stale one is simply dropped.
+  assert.match(prompt, /treat each like a finding of your\s+own/);
+  assert.match(prompt, /drop it when it is stale or wrong/);
+  assert.doesNotMatch(prompt, /## Addressed comments|## Advisory Notes/);
 });
 
 // A review run failed here with a bare "harness exited with code 137". 137 is
@@ -636,4 +644,209 @@ test('logHarnessFailureDiagnostics survives a harness result with nothing in it'
   logHarnessFailureDiagnostics(ctx, { owner: 'o', repo: 'r', number: 1 }, {}, 1);
   assert.equal(logged.length, 1);
   assert.equal(logged[0].fields.outputTail, undefined);
+});
+
+// ── the review comment ──────────────────────────────────────────────────────
+// Every review is rendered from the json report the harness ends with. These
+// pin both halves of that contract and the comment it produces.
+
+const SHA = '276ddd11412c852702afcd4f4757ff0e84574a3a';
+
+function reportBlock(report) {
+  return ['```json', JSON.stringify(report, null, 2), '```'].join('\n');
+}
+
+test('reviewHarnessPrompt asks for P0-P2 findings in one json report', () => {
+  const prompt = reviewHarnessPrompt({ owner: 'wepost-no', repo: 'wepost-saga', number: 5347 });
+  assert.match(prompt, /P0: must fix before merge/);
+  assert.match(prompt, /P1: should fix before merge/);
+  assert.match(prompt, /P2: worth fixing, not blocking/);
+  assert.match(prompt, /Report at most 5 findings, most severe first/);
+  assert.match(prompt, /never pad the list/);
+  assert.match(prompt, /do not summarize the PR, narrate what you did, or add notes or\s+disclaimers/);
+  // A backgrounded typecheck ended two runs with "I'll continue when it
+  // finishes", and that sentence was posted as the review.
+  assert.match(prompt, /never background a\s+command or schedule a wake-up/);
+  assert.match(prompt, /After the block, end with READY on its own last line/);
+});
+
+test('the report example in the prompt is one the parser accepts', () => {
+  // The prompt and parseReviewReport are two halves of one contract: an example
+  // the parser rejects would teach the harness a shape that is never posted.
+  const report = parseReviewReport(reviewHarnessPrompt({ owner: 'o', repo: 'r', number: 1 }));
+  assert.ok(report, 'the prompt example must parse');
+  assert.equal(report.findings.length, 1);
+  const { body, ...finding } = report.findings[0];
+  assert.deepEqual(finding, {
+    priority: 'P1',
+    title: 'Charge once when the webhook races the retry',
+    path: 'src/billing/invoice.ts',
+    line: 88,
+    endLine: 94,
+  });
+  assert.match(body, /billed twice/);
+  assert.equal(report.fixes.length, 1);
+  assert.equal(report.checks.length, 2);
+});
+
+test('parseReviewReport returns nothing for narration without a report', () => {
+  // Both of these were posted verbatim as "reviews" on wepost-saga#5334.
+  assert.equal(parseReviewReport('Tests pass (128/128). The `tsgo` typecheck is still running in the background — I\'ll continue automatically when it finishes.'), undefined);
+  assert.equal(parseReviewReport('I\'ve scheduled a fallback wake-up. Now waiting for the tsgo type check to finish, which will re-invoke me.'), undefined);
+  assert.equal(parseReviewReport('```json\n{ "findings": [ oops ] }\n```'), undefined, 'invalid json');
+  assert.equal(parseReviewReport('```json\n{ "summary": "looks good" }\n```'), undefined, 'no findings array');
+  assert.equal(parseReviewReport('```json\n[]\n```'), undefined, 'not an object');
+});
+
+test('parseReviewReport reads the LAST json block and ignores the prose and READY around it', () => {
+  const output = [
+    'The review is complete. Let me write up my findings.',
+    reportBlock({ findings: [{ priority: 'P2', title: 'an example I quoted' }] }),
+    'Here is the report:',
+    reportBlock({ findings: [], fixes: [], checks: ['jest: 12 passed'] }),
+    'READY',
+  ].join('\n');
+  assert.deepEqual(parseReviewReport(output), { findings: [], fixes: [], checks: ['jest: 12 passed'] });
+});
+
+test('parseReviewReport validates each finding and sorts them P0 first', () => {
+  const report = parseReviewReport(reportBlock({
+    findings: [
+      { priority: 'P2', title: 'second P2', path: 'b.ts', line: 3 },
+      { priority: 'p0', title: '  crash\n on   save ', path: './app/[id]/page.tsx', line: 10, endLine: 12, body: ' Why and fix. ' },
+      { priority: 'P3', title: 'a nit, kept off the PR' },
+      { priority: 'P1', title: '' },
+      { priority: 'P1', title: 'no location', line: 7 },
+      { priority: 'P2', title: 'backwards range', path: 'c.ts', line: 9, endLine: 4 },
+      { priority: 'P2', title: 'fractional line', path: 'd.ts', line: 1.5 },
+      'not an object',
+    ],
+    fixes: ['prettier: a.ts', 42, '  '],
+    checks: 'not a list',
+  }));
+  assert.deepEqual(report, {
+    findings: [
+      { priority: 'P0', title: 'crash on save', path: 'app/[id]/page.tsx', line: 10, endLine: 12, body: 'Why and fix.' },
+      { priority: 'P1', title: 'no location', body: '' },
+      { priority: 'P2', title: 'second P2', path: 'b.ts', line: 3, body: '' },
+      { priority: 'P2', title: 'backwards range', path: 'c.ts', line: 9, body: '' },
+      { priority: 'P2', title: 'fractional line', path: 'd.ts', body: '' },
+    ],
+    fixes: ['prettier: a.ts'],
+    checks: [],
+  });
+});
+
+test('renderReview says "no issues" in one heading when the review is clean', () => {
+  const body = renderReview(
+    { findings: [], fixes: [], checks: ['jest content-director: 218 passed', 'tsgo full typecheck: not run (sandbox memory limit)'] },
+    { owner: 'wepost-no', repo: 'wepost-saga', sha: SHA },
+  );
+  assert.equal(body, [
+    '### ✅ No issues found',
+    '',
+    '**Reviewed commit:** `276ddd1141`',
+    '',
+    '<details><summary>Checks run</summary>',
+    '',
+    '- jest content-director: 218 passed',
+    '- tsgo full typecheck: not run (sandbox memory limit)',
+    '',
+    '</details>',
+  ].join('\n'));
+});
+
+test('renderReview leads with the verdict, then each finding as badge, title, snippet, paragraph', () => {
+  const body = renderReview({
+    findings: [
+      {
+        priority: 'P0',
+        title: '`lookupInHand` test fails at HEAD',
+        path: 'app/[id]/planner tools.test.ts',
+        line: 40,
+        endLine: 52,
+        body: 'The fixture uploads carry no render policy, so the lookup returns nothing. Classify the fixtures.',
+      },
+      { priority: 'P2', title: 'Log noise on capped streams', path: 'utils/ai/stream.ts', line: 7, body: '' },
+    ],
+    fixes: ['prettier: utils/ai/stream.ts'],
+    checks: [],
+  }, { owner: 'wepost-no', repo: 'wepost-saga', sha: SHA });
+  assert.equal(body, [
+    '### 🔴 1 P0 · 🟡 1 P2',
+    '',
+    '**Reviewed commit:** `276ddd1141`',
+    '',
+    '**<sub><sub>![P0 Badge](https://img.shields.io/badge/P0-red?style=flat)</sub></sub>  `lookupInHand` test fails at HEAD**',
+    '',
+    // A permalink alone on its line is what GitHub embeds as a code snippet.
+    `https://github.com/wepost-no/wepost-saga/blob/${SHA}/app/%5Bid%5D/planner%20tools.test.ts#L40-L52`,
+    '',
+    'The fixture uploads carry no render policy, so the lookup returns nothing. Classify the fixtures.',
+    '',
+    '---',
+    '',
+    '**<sub><sub>![P2 Badge](https://img.shields.io/badge/P2-yellow?style=flat)</sub></sub>  Log noise on capped streams**',
+    '',
+    `https://github.com/wepost-no/wepost-saga/blob/${SHA}/utils/ai/stream.ts#L7`,
+    '',
+    '🔧 **Mechanical fixes:**',
+    '- prettier: utils/ai/stream.ts',
+  ].join('\n'));
+});
+
+test('renderReview falls back to plain path:line without a usable commit, and marks a ready PR', () => {
+  const report = { findings: [{ priority: 'P1', title: 'Wrong total', path: 'a.ts', line: 3, body: 'Why.' }], fixes: [], checks: [] };
+  for (const sha of [undefined, 'not-a-sha']) {
+    const body = renderReview(report, { owner: 'o', repo: 'r', sha });
+    assert.doesNotMatch(body, /Reviewed commit|https:\/\/github\.com/);
+    assert.match(body, /^### 🟠 1 P1$/m);
+    assert.match(body, /^`a\.ts:3`$/m);
+  }
+  assert.match(
+    renderReview({ findings: [], fixes: [], checks: [] }, { owner: 'o', repo: 'r', sha: SHA }, true),
+    /\n\n:white_check_mark: This PR is ready for your review\.$/,
+  );
+});
+
+test('supersededByPush drops a review only when a push landed mid-pass', async () => {
+  // On wepost-saga#5334 a "blocking: this test fails" review landed ten minutes
+  // after the author pushed the fix, because each pass posted whatever it saw.
+  const mountRoot = mkdtempSync(join(tmpdir(), 'pr-reviewer-vfs-'));
+  const oldMountRoot = process.env.RELAYFILE_MOUNT_ROOT;
+  process.env.RELAYFILE_MOUNT_ROOT = mountRoot;
+  try {
+    const pr = { owner: 'wepost-no', repo: 'wepost-saga', number: 5334, url: '', author: 'h-graesberg' };
+    const logged = [];
+    const ctx = { log: (level, message, fields) => logged.push({ level, message, fields }) };
+    const [older, reviewed, newer] = ['a', 'b', 'c'].map((ch) => ch.repeat(40));
+    const dir = join(mountRoot, 'github/repos/wepost-no/wepost-saga/pulls/5334');
+    const projectHead = (sha) => {
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, 'meta.json'), JSON.stringify({ head: { sha } }));
+    };
+
+    assert.equal(await supersededByPush(ctx, pr, [reviewed, reviewed]), false, 'no projected head: post');
+    projectHead(reviewed);
+    assert.equal(await supersededByPush(ctx, pr, [reviewed, reviewed]), false, 'head unchanged: post');
+    assert.equal(await supersededByPush(ctx, pr, [undefined, undefined]), false, 'nothing to compare: post');
+    // The projection lagged the event at the start and caught up since.
+    assert.equal(await supersededByPush(ctx, pr, [reviewed, older]), false, 'lagging projection: post');
+    projectHead(older);
+    // The projection never moved off an old head; it must not silence reviews.
+    assert.equal(await supersededByPush(ctx, pr, [reviewed, older]), false, 'stale projection: post');
+    assert.deepEqual(logged, []);
+
+    projectHead(newer);
+    assert.equal(await supersededByPush(ctx, pr, [reviewed, reviewed]), true, 'a push landed mid-pass: drop');
+    assert.equal(await supersededByPush(ctx, pr, [undefined, reviewed]), true, 'event without a sha: drop too');
+    assert.equal(logged.length, 2);
+    assert.equal(logged[0].message, 'pr-reviewer review superseded by a newer push');
+    assert.deepEqual(logged[0].fields.startHeads, [reviewed, reviewed]);
+    assert.equal(logged[0].fields.headSha, newer);
+  } finally {
+    if (oldMountRoot === undefined) delete process.env.RELAYFILE_MOUNT_ROOT;
+    else process.env.RELAYFILE_MOUNT_ROOT = oldMountRoot;
+    rmSync(mountRoot, { recursive: true, force: true });
+  }
 });

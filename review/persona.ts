@@ -71,9 +71,11 @@ export default definePersona({
   useSubscription: true,
 
   harness: 'claude',
-  model: 'claude-opus-4-8',
+  // The team writes its code with Opus 5.5, so the reviewer runs on it too.
+  model: 'claude-opus-5-5',
   systemPrompt: 'You are a rigorous senior reviewer. Review PRs, auto-apply only lint/format/typo fixes, leave logic and safety changes as comments, keep CI honest, and only hand back when the PR is genuinely ready.',
   harnessSettings: {
+    // Keep this explicit: Opus 5.5's own default effort is medium.
     reasoning: 'high',
     timeoutSeconds: 2400,
   },

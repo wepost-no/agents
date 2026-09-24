@@ -14,6 +14,25 @@ or termination paths, and test changes are suggestion/comment-only so a human
 author owns them. Its review comment says when a PR is ready for your review,
 and it can merge the PR if you approve.
 
+## What a review looks like
+
+One comment per review, rendered by code from a JSON report the agent ends its
+run with, so every review has the same shape:
+
+- **The heading is the verdict:** `🔴 1 P0 · 🟠 2 P1`, or `✅ No issues found`.
+- **Findings, most severe first, at most five**, in the format Codex's reviews
+  use: a P0/P1/P2 badge and a one-line title, a permalink GitHub shows as a code
+  snippet, and one paragraph on what triggers it, what breaks, and the fix.
+  - **P0** must fix before merge: breaks the build or a test, crashes or
+    corrupts data on a common path, or opens a security hole.
+  - **P1** should fix before merge: a real bug in a realistic scenario.
+  - **P2** worth fixing, not blocking: needs unusual input or timing, or is a
+    concrete performance or maintenance hazard.
+- Any mechanical fixes it made, then the checks it ran, folded away.
+
+It posts nothing when a run fails (that goes to the logs), or when a newer push
+landed while it was reviewing (the run for that push reviews the new head).
+
 ## Resolving merge conflicts (opt-in)
 
 Comment **`@relay fix conflicts`** on a PR and the agent resolves its merge
