@@ -25,6 +25,7 @@ it does). The persona compiles to `persona.json`; deploy with
 | [**neon-monitor**](neon-monitor/) | Neon sync-delta triggers (`operation.failed` / `endpoint.state_changed` / `advisor.issue_raised`) + 2h sweep | Watches your Neon org for failed operations, endpoint thrash, advisor issues, and runaway compute/spend; posts Slack alerts and answers questions about live Neon state. |
 | [**repo-hygiene**](repo-hygiene/) | GitHub PR opened / updated | Diagnoses duplicated/dead code, divergent paths, stale skills/rules/docs, and code smells; comments findings and journals the run to Notion. |
 | [**review**](review/) | GitHub PR opened / updated / reviewed / CI finished | Reviews the PR, fixes the issues it (and other bots) find, resolves failing CI and merge conflicts, flags when it's ready for you, and merges once you approve. |
+| [**review-codex**](review-codex/) | same as review | The same reviewer on Codex, for the PRs Claude wrote, so no model reviews its own work. |
 | [**spotify-releases**](spotify-releases/) | schedule (daily) | Checks for new releases from artists you follow and DMs them to you. |
 | [**vendor-monitor**](vendor-monitor/) | schedule (weekday mornings) | Watches the vendors in your stack for new releases and posts changes to your team channel. |
 

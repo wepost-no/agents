@@ -79,6 +79,10 @@
       "persona": "review/persona.ts"
     },
     {
+      "name": "review-codex",
+      "persona": "review-codex/persona.ts"
+    },
+    {
       "name": "spotify-releases",
       "persona": "spotify-releases/persona.ts"
     },

@@ -40,6 +40,8 @@ export interface Pr {
   url: string;
   author: string; // github login of whoever opened the PR
   headSha?: string;
+  headRef?: string; // the PR branch
+  body?: string; // the PR description, where coding agents sign their work
   state?: string;
   merged?: boolean;
   draft?: boolean;
@@ -99,6 +101,14 @@ export default defineAgent({
   const data = (await event.expand('full')).data;
 
   const pr = readPr(data);
+
+  // With a Claude and a Codex reviewer deployed side by side, each PR belongs
+  // to exactly one of them (see reviewedElsewhere); the other ignores it.
+  const elsewhere = pr ? await reviewedElsewhere(ctx, pr) : null;
+  if (pr && elsewhere) {
+    ctx.log?.('info', 'pr-reviewer skipped', { owner: pr.owner, repo: pr.repo, number: pr.number, reason: elsewhere });
+    return;
+  }
 
   if (pr && mergeOnGreenEventType(event.type)) {
     const outcome = await maybeMergeOnGreen(ctx, pr);
@@ -264,6 +274,44 @@ async function shouldSkipReview(ctx: WorkforceCtx, pr: Pr): Promise<{ reason: st
   }
 
   return null;
+}
+
+/**
+ * Which model family wrote a PR, from the marks coding agents leave on the PRs
+ * they open: Claude Code's "Generated with Claude Code" footer or a Claude
+ * co-author line, a Codex task link, or Codex's `codex/` branch. 'other' when
+ * there is no mark: a person, or a tool that signs nothing.
+ */
+export type PrWriter = 'claude' | 'codex' | 'other';
+
+export function prWrittenBy(pr: { body?: string; headRef?: string }): PrWriter {
+  const body = pr.body ?? '';
+  if (/Generated with \[Claude Code\]|Co-Authored-By: Claude/i.test(body)) return 'claude';
+  if (/chatgpt\.com\/codex|Co-Authored-By: Codex/i.test(body) || /^codex\//i.test(pr.headRef ?? '')) return 'codex';
+  return 'other';
+}
+
+/**
+ * Why this PR belongs to the other reviewer deployment, or null when it is
+ * ours. REVIEWS_PRS_WRITTEN_BY splits PRs between the Claude reviewer and the
+ * Codex one (review-codex/) by who wrote the code, so each PR is reviewed by
+ * the model family that did not write it; unset, every PR is ours. Checked
+ * before anything else, merge included, so one deployment acts on each PR.
+ */
+export async function reviewedElsewhere(ctx: WorkforceCtx, pr: Pr): Promise<string | null> {
+  const takes = new Set(
+    (input(ctx, 'REVIEWS_PRS_WRITTEN_BY') ?? '').split(',').map((s) => s.trim().toLowerCase()).filter(Boolean),
+  );
+  if (takes.size === 0) return null;
+  // A check_run payload carries no description; the PR record does.
+  const meta = pr.body === undefined ? await loadPrMeta(pr) : undefined;
+  const metaHead = meta?.head as { ref?: unknown } | undefined;
+  const writer = prWrittenBy({
+    body: pr.body ?? (typeof meta?.body === 'string' ? meta.body : undefined),
+    headRef: pr.headRef ?? (typeof metaHead?.ref === 'string' ? metaHead.ref : undefined),
+  });
+  if (takes.has(writer)) return null;
+  return `written by ${writer}; this reviewer takes PRs written by ${[...takes].join(', ')}`;
 }
 
 /** Lowercased PR author login, preferring the authoritative meta.json (string
@@ -514,7 +562,7 @@ async function reviewAndFix(ctx: WorkforceCtx, pr: Pr): Promise<void> {
   // bot/reviewer comments resolved, nothing left for the agent to fix (the
   // READY sentinel). Every in-progress pass posts the review on its own.
   const ready = harnessReady && await verifyReadyForHumanReview(ctx, pr);
-  const body = renderReview(report, { owner: pr.owner, repo: pr.repo, sha: reviewedSha }, ready);
+  const body = renderReview(report, { owner: pr.owner, repo: pr.repo, sha: reviewedSha, reviewer: personaModel(ctx) }, ready);
   await githubClient().comment({ owner: pr.owner, repo: pr.repo, number: pr.number }, body);
 }
 
@@ -1186,7 +1234,8 @@ export function readPr(payload: unknown): Pr | undefined {
       number?: number;
       html_url?: string;
       user?: { login?: string };
-      head?: { sha?: string };
+      head?: { sha?: string; ref?: string };
+      body?: string | null;
       state?: string;
       merged?: boolean;
       draft?: boolean;
@@ -1196,6 +1245,7 @@ export function readPr(payload: unknown): Pr | undefined {
       number?: number;
       html_url?: string;
       user?: { login?: string };
+      body?: string | null;
       state?: string;
       draft?: boolean;
       labels?: unknown;
@@ -1228,6 +1278,8 @@ export function readPr(payload: unknown): Pr | undefined {
   const state = p?.pull_request?.state ?? prIssue?.state;
   const draft = typeof p?.pull_request?.draft === 'boolean' ? p.pull_request.draft : prIssue?.draft;
   const labels = p?.pull_request?.labels ?? prIssue?.labels;
+  const headRef = p?.pull_request?.head?.ref;
+  const body = p?.pull_request?.body ?? prIssue?.body;
   return {
     owner,
     repo,
@@ -1235,6 +1287,8 @@ export function readPr(payload: unknown): Pr | undefined {
     url: prRef?.html_url ?? `https://github.com/${owner}/${repo}/pull/${number}`,
     author,
     ...(headSha ? { headSha } : {}),
+    ...(headRef ? { headRef } : {}),
+    ...(typeof body === 'string' ? { body } : {}),
     ...(state ? { state } : {}),
     ...(typeof p?.pull_request?.merged === 'boolean' ? { merged: p.pull_request.merged } : {}),
     ...(typeof draft === 'boolean' ? { draft } : {}),
@@ -1297,6 +1351,11 @@ function lastLine(text: string): string {
 function stripLastLine(text: string): string {
   const i = text.lastIndexOf('\n');
   return i < 0 ? '' : text.slice(0, i);
+}
+/** The model this deployment reviews with, e.g. claude-opus-5-5 or gpt-5.5. */
+export function personaModel(ctx: WorkforceCtx): string | undefined {
+  const model: unknown = ctx.persona.model;
+  return typeof model === 'string' && model.trim() ? model.trim() : undefined;
 }
 function input(ctx: WorkforceCtx, name: string): string | undefined {
   const spec = ctx.persona.inputSpecs?.[name];
