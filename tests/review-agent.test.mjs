@@ -24,9 +24,14 @@ import {
   resolveAuthorLogin,
   reviewHarnessPrompt,
   reviewAuthorAllowlistDecision,
+  personaModel,
+  prWrittenBy,
+  reviewedElsewhere,
   rollupFromCheckSummary,
   supersededByPush,
 } from '../.test-build/review/agent.js';
+import claudeReviewer from '../.test-build/review/persona.js';
+import codexReviewer from '../.test-build/review-codex/persona.js';
 import { parseReviewReport, renderReview } from '../.test-build/review/lib/review-comment.js';
 
 function conflictCtx({ approvers, reviewAuthors } = {}) {
@@ -849,4 +854,107 @@ test('supersededByPush drops a review only when a push landed mid-pass', async (
     else process.env.RELAYFILE_MOUNT_ROOT = oldMountRoot;
     rmSync(mountRoot, { recursive: true, force: true });
   }
+});
+
+// ── cross-model review ──────────────────────────────────────────────────────
+// A Claude and a Codex deployment of this reviewer split the PRs by who wrote
+// the code, so no model grades its own work.
+
+const CLAUDE_FOOTER = '## Summary\n\nFixes the thing.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)';
+
+function writtenByCtx(takes, model) {
+  return {
+    persona: {
+      ...(model !== undefined ? { model } : {}),
+      inputSpecs: { REVIEWS_PRS_WRITTEN_BY: { env: '__TEST_REVIEWS_PRS_WRITTEN_BY__' } },
+      inputs: takes === undefined ? {} : { REVIEWS_PRS_WRITTEN_BY: takes },
+    },
+    log: () => {},
+  };
+}
+
+test('prWrittenBy reads the mark each coding agent leaves on the PRs it opens', () => {
+  assert.equal(prWrittenBy({ body: CLAUDE_FOOTER }), 'claude');
+  assert.equal(prWrittenBy({ body: 'Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>' }), 'claude');
+  assert.equal(prWrittenBy({ body: 'Codex Task: https://chatgpt.com/codex/tasks/task_e_68d1f0' }), 'codex');
+  assert.equal(prWrittenBy({ body: 'Adds retries.', headRef: 'codex/add-retries' }), 'codex');
+  assert.equal(prWrittenBy({ body: 'Hand-written fix.', headRef: 'feat/seed-carousel-admin-tools' }), 'other');
+  assert.equal(prWrittenBy({}), 'other');
+  // A branch named after a Codex feature is not Codex's work.
+  assert.equal(prWrittenBy({ body: CLAUDE_FOOTER, headRef: 'michaeliolsen/tech-2435-codex-card' }), 'claude');
+});
+
+test('readPr carries the PR branch and description the authorship check reads', () => {
+  const pr = readPr({
+    repository: { name: 'wepost-saga', owner: { login: 'wepost-no' } },
+    pull_request: { number: 5347, user: { login: 'H-Graesberg' }, head: { sha: 'd144e72', ref: 'fix-director-treatment-length' }, body: CLAUDE_FOOTER },
+  });
+  assert.equal(pr.headRef, 'fix-director-treatment-length');
+  assert.equal(pr.body, CLAUDE_FOOTER);
+  const fromComment = readPr({
+    repository: { name: 'wepost-saga', owner: { login: 'wepost-no' } },
+    issue: { number: 5347, pull_request: {}, user: { login: 'H-Graesberg' }, body: CLAUDE_FOOTER },
+  });
+  assert.equal(fromComment.body, CLAUDE_FOOTER);
+  const noDescription = readPr({
+    repository: { name: 'wepost-saga', owner: { login: 'wepost-no' } },
+    pull_request: { number: 1, user: { login: 'a' }, body: null },
+  });
+  assert.equal('body' in noDescription, false, 'a null description reads as unknown, so the PR record is consulted');
+});
+
+test('the two reviewer personas take every kind of PR exactly once', () => {
+  const takes = (persona) => new Set(persona.inputs.REVIEWS_PRS_WRITTEN_BY.default.split(','));
+  const claude = takes(claudeReviewer);
+  const codex = takes(codexReviewer);
+  for (const writer of ['claude', 'codex', 'other']) {
+    assert.equal(Number(claude.has(writer)) + Number(codex.has(writer)), 1, `a PR written by ${writer} needs exactly one reviewer`);
+  }
+  assert.equal(codex.has('claude'), true, 'Codex reviews what Claude wrote');
+  assert.equal(claude.has('codex'), true, 'Claude reviews what Codex wrote');
+  assert.equal(claudeReviewer.harness, 'claude');
+  assert.equal(codexReviewer.harness, 'codex');
+  assert.notEqual(codexReviewer.id, claudeReviewer.id);
+  assert.equal(codexReviewer.harnessSettings.dangerouslyBypassApprovalsAndSandbox, true);
+});
+
+test('reviewedElsewhere hands a PR to the deployment that did not write it', async () => {
+  const pr = { owner: 'wepost-no', repo: 'wepost-saga', number: 5347, url: '', author: 'h-graesberg', body: CLAUDE_FOOTER };
+  assert.equal(await reviewedElsewhere(writtenByCtx('claude'), pr), null, 'the Codex reviewer takes a Claude PR');
+  assert.equal(
+    await reviewedElsewhere(writtenByCtx('codex,other'), pr),
+    'written by claude; this reviewer takes PRs written by codex, other',
+  );
+  assert.equal(await reviewedElsewhere(writtenByCtx(undefined), pr), null, 'unset: every PR is reviewed');
+  assert.equal(await reviewedElsewhere(writtenByCtx('codex,other'), { ...pr, body: 'Hand-written.' }), null, 'a person\'s PR goes to Claude');
+});
+
+test('reviewedElsewhere reads the PR record when the event carries no description', async () => {
+  // check_run.completed payloads have no PR body; the mirrored PR record does.
+  const mountRoot = mkdtempSync(join(tmpdir(), 'pr-reviewer-vfs-'));
+  const oldMountRoot = process.env.RELAYFILE_MOUNT_ROOT;
+  process.env.RELAYFILE_MOUNT_ROOT = mountRoot;
+  try {
+    const pr = { owner: 'wepost-no', repo: 'wepost-saga', number: 5352, url: '', author: 'bjorginho' };
+    const dir = join(mountRoot, 'github/repos/wepost-no/wepost-saga/pulls/5352');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'meta.json'), JSON.stringify({ body: CLAUDE_FOOTER, head: { sha: 'e'.repeat(40), ref: 'feature/tech-2777' } }));
+    assert.match(await reviewedElsewhere(writtenByCtx('codex,other'), pr), /^written by claude/);
+    assert.equal(await reviewedElsewhere(writtenByCtx('claude'), pr), null);
+    writeFileSync(join(dir, 'meta.json'), JSON.stringify({ head: { ref: 'codex/fix-retry' } }));
+    assert.equal(await reviewedElsewhere(writtenByCtx('codex,other'), pr), null, 'the codex/ branch marks it Codex-written');
+  } finally {
+    if (oldMountRoot === undefined) delete process.env.RELAYFILE_MOUNT_ROOT;
+    else process.env.RELAYFILE_MOUNT_ROOT = oldMountRoot;
+    rmSync(mountRoot, { recursive: true, force: true });
+  }
+});
+
+test('the comment names the model that reviewed, since both post as one bot', () => {
+  assert.equal(personaModel(writtenByCtx(undefined, ' gpt-5.5 ')), 'gpt-5.5');
+  assert.equal(personaModel(writtenByCtx(undefined, undefined)), undefined);
+  assert.equal(personaModel({ persona: { model: 42 } }), undefined);
+  const body = renderReview({ findings: [], fixes: [], checks: [] }, { owner: 'o', repo: 'r', sha: SHA, reviewer: 'gpt-5.5' });
+  assert.equal(body, '### ✅ No issues found\n\n**Reviewed commit:** `276ddd1141` · **Reviewer:** `gpt-5.5`');
+  assert.match(renderReview({ findings: [], fixes: [], checks: [] }, { owner: 'o', repo: 'r', reviewer: 'claude-opus-4-8' }), /^\*\*Reviewer:\*\* `claude-opus-4-8`$/m);
 });

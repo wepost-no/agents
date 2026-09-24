@@ -56,6 +56,15 @@ export default definePersona({
       description: 'PR labels that disable the reviewer entirely (comma-separated). Defaults to "no-agent-relay-review".',
       env: 'SKIP_LABELS',
       optional: true
+    },
+    // Cross-model review: this Claude reviewer takes the PRs Codex (or a
+    // person) wrote, and pr-reviewer-codex (review-codex/) takes the ones
+    // Claude wrote, so no model grades its own work. Deploy this reviewer with
+    // claude,codex,other to have it take every PR, e.g. without the Codex one.
+    REVIEWS_PRS_WRITTEN_BY: {
+      description: 'Only review PRs whose code was written by these (comma-separated: claude, codex, other). claude,codex,other reviews every PR.',
+      env: 'REVIEWS_PRS_WRITTEN_BY',
+      default: 'codex,other'
     }
   },
 

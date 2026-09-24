@@ -98,11 +98,13 @@ function positiveInteger(value: unknown): number | undefined {
  * The PR comment. Verdict first, so the heading alone says whether there is
  * anything to act on; then the findings, any mechanical fixes, and the checks
  * folded into a <details> nobody has to scroll past. `sha` is the reviewed
- * commit; without one, a location falls back to plain `path:line`.
+ * commit; without one, a location falls back to plain `path:line`. `reviewer`
+ * is the model that reviewed, since a Claude and a Codex deployment post as the
+ * same bot.
  */
 export function renderReview(
   report: ReviewReport,
-  pr: { owner: string; repo: string; sha?: string },
+  pr: { owner: string; repo: string; sha?: string; reviewer?: string },
   ready = false,
 ): string {
   const sha = pr.sha && /^[0-9a-f]{7,40}$/i.test(pr.sha) ? pr.sha : undefined;
@@ -111,7 +113,11 @@ export function renderReview(
     .filter(({ count }) => count > 0)
     .map(({ priority, count }) => `${PRIORITY_STYLE[priority].emoji} ${count} ${priority}`);
   const lines = [`### ${counts.length ? counts.join(' · ') : '✅ No issues found'}`];
-  if (sha) lines.push('', `**Reviewed commit:** \`${sha.slice(0, 10)}\``);
+  const byline = [
+    ...(sha ? [`**Reviewed commit:** \`${sha.slice(0, 10)}\``] : []),
+    ...(pr.reviewer ? [`**Reviewer:** \`${pr.reviewer}\``] : []),
+  ];
+  if (byline.length) lines.push('', byline.join(' · '));
   report.findings.forEach((finding, i) => {
     lines.push('', ...(i > 0 ? ['---', ''] : []), ...renderFinding(finding, pr, sha));
   });
