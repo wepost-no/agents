@@ -956,5 +956,5 @@ test('the comment names the model that reviewed, since both post as one bot', ()
   assert.equal(personaModel({ persona: { model: 42 } }), undefined);
   const body = renderReview({ findings: [], fixes: [], checks: [] }, { owner: 'o', repo: 'r', sha: SHA, reviewer: 'gpt-5.5' });
   assert.equal(body, '### ✅ No issues found\n\n**Reviewed commit:** `276ddd1141` · **Reviewer:** `gpt-5.5`');
-  assert.match(renderReview({ findings: [], fixes: [], checks: [] }, { owner: 'o', repo: 'r', reviewer: 'claude-opus-4-8' }), /^\*\*Reviewer:\*\* `claude-opus-4-8`$/m);
+  assert.match(renderReview({ findings: [], fixes: [], checks: [] }, { owner: 'o', repo: 'r', reviewer: 'claude-opus-5-5' }), /^\*\*Reviewer:\*\* `claude-opus-5-5`$/m);
 });

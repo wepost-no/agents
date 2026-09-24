@@ -41,7 +41,7 @@ and the two split the PRs by who wrote the code:
 | PR written by | Reviewed by |
 | --- | --- |
 | Claude (the "Generated with Claude Code" footer or a Claude co-author line) | [`review-codex`](../review-codex/) on Codex, `gpt-5.5` |
-| Codex (a Codex task link or a `codex/` branch) | this reviewer on Claude, `claude-opus-4-8` |
+| Codex (a Codex task link or a `codex/` branch) | this reviewer on Claude, `claude-opus-5-5` |
 | anything unmarked (a person) | this reviewer on Claude |
 
 `REVIEWS_PRS_WRITTEN_BY` sets which PRs each one takes. Each review names the

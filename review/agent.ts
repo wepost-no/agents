@@ -1352,7 +1352,7 @@ function stripLastLine(text: string): string {
   const i = text.lastIndexOf('\n');
   return i < 0 ? '' : text.slice(0, i);
 }
-/** The model this deployment reviews with, e.g. claude-opus-4-8 or gpt-5.5. */
+/** The model this deployment reviews with, e.g. claude-opus-5-5 or gpt-5.5. */
 export function personaModel(ctx: WorkforceCtx): string | undefined {
   const model: unknown = ctx.persona.model;
   return typeof model === 'string' && model.trim() ? model.trim() : undefined;
