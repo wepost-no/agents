@@ -8,6 +8,7 @@ import {
   commentBody,
   commenterLogin,
   attributeCiFailure,
+  carriedCiObservation,
   ciObservationFor,
   failingCheckGuidance,
   readFailingCheck,
@@ -1176,4 +1177,29 @@ test('ciObservationFor records ownership only while CI is red and ours', () => {
   assert.equal(obs.ciFailing, true);
   assert.equal(obs.leftEdits, true, 'upper bound: the agent cannot see the push outcome');
   assert.equal(ciObservationFor({ ...pr, headSha: undefined }, { failing: false, attribution: 'unknown' }).headSha, null);
+});
+
+test('carriedCiObservation keeps the last check_run verdict through non-CI events', () => {
+  const pr = { owner: 'wepost-no', repo: 'wepost-saga', number: 5020, headSha: 'new-head' };
+
+  // A synchronize lands between the red check and CI's verdict on the new
+  // head. Carrying the observation forward — head, verdict and ownership —
+  // keeps attribution anchored to what CI actually said, so the failure the
+  // new head produces still reads as ours instead of 'unknown'.
+  const red = { headSha: 'abc', ciFailing: true, leftEdits: true, ownedRegression: true };
+  const carried = carriedCiObservation(pr, red);
+  assert.equal(carried.headSha, 'abc', 'the event\'s head is not an observation');
+  assert.equal(carried.ciFailing, true);
+  assert.equal(carried.ownedRegression, true);
+  assert.equal(carried.leftEdits, true, 'this pass may be the one CI judges next');
+
+  const green = { headSha: 'abc', ciFailing: false, leftEdits: true, ownedRegression: false };
+  assert.equal(carriedCiObservation(pr, green).ciFailing, false);
+
+  // First contact: nothing observed yet, so the event's head anchors the
+  // baseline like before.
+  const first = carriedCiObservation(pr, null);
+  assert.equal(first.headSha, 'new-head');
+  assert.equal(first.ciFailing, false);
+  assert.equal(first.ownedRegression, false);
 });

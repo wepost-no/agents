@@ -146,7 +146,33 @@ export default defineAgent({
     return;
   }
 
-  // A check run that finished without failing needs no action.
+  if (event.type === 'github.check_run.completed' && pr) {
+    // A check that finished for a superseded head describes code we are no
+    // longer looking at: recording it would timestamp the observation with a
+    // stale sha and feed the review pass diagnostics for a different commit.
+    const liveHead = await currentHeadSha(pr);
+    if (pr.headSha && liveHead && pr.headSha !== liveHead) {
+      ctx.log?.('info', 'pr-reviewer ignored a check run for a superseded head', {
+        owner: pr.owner,
+        repo: pr.repo,
+        number: pr.number,
+        checkHeadSha: pr.headSha,
+        headSha: liveHead,
+      });
+      return;
+    }
+    if (!ciFailed(data)) {
+      // Green on the live head is the only thing that clears an owned
+      // regression — returning without recording would keep it owned forever.
+      await rememberCiObservation(ctx, pr, {
+        headSha: pr.headSha ?? liveHead ?? null,
+        ciFailing: false,
+        leftEdits: false,
+        ownedRegression: false,
+      });
+      return;
+    }
+  }
   if (event.type === 'github.check_run.completed' && !ciFailed(data)) return;
 
   // Everything else is a reason to (re)review and apply safe mechanical fixes.
@@ -171,6 +197,7 @@ export default defineAgent({
     await reviewAndFix(ctx, pr, {
       failing: ciFailing,
       attribution,
+      observed: event.type === 'github.check_run.completed',
       ...(ciFailing ? { check: readFailingCheck(data) } : {}),
     });
   } else if (event.type === 'github.check_run.completed') {
@@ -523,8 +550,8 @@ export function logHarnessFailureDiagnostics(
 async function reviewAndFix(
   ctx: WorkforceCtx,
   pr: Pr,
-  ci: { failing: boolean; attribution: CiFailureAttribution; check?: FailingCheck } =
-    { failing: false, attribution: 'unknown' },
+  ci: { failing: boolean; attribution: CiFailureAttribution; check?: FailingCheck; observed?: boolean } =
+    { failing: false, attribution: 'unknown', observed: false },
 ): Promise<void> {
   // The commit this pass reviews: its findings link to code at this SHA, and a
   // push that lands while the pass runs makes the review stale (checked below).
@@ -536,7 +563,10 @@ async function reviewAndFix(
   // records true. That biases attribution toward blaming ourselves first, which
   // is the safe direction: investigating our own edit costs a read, while
   // missing our own regression costs the author a broken PR.
-  await rememberCiObservation(ctx, pr, ciObservationFor(pr, ci));
+  const observation = ci.observed
+    ? ciObservationFor(pr, ci)
+    : carriedCiObservation(pr, await recallCiObservation(ctx, pr));
+  await rememberCiObservation(ctx, pr, observation);
 
   const { run, exitCode, infraKill } = await runReviewHarnessWithRetry(
     () => ctx.harness.run({
@@ -772,6 +802,28 @@ export function ciObservationFor(
     // carrying it forward here is what preserves it across a failed repair.
     ownedRegression: ci.failing && ci.attribution === 'ours',
   };
+}
+
+/**
+ * The observation a non-CI event (a push, a review, a comment) leaves behind.
+ * Recording `ciFailing: false` at the event's head would overwrite the last
+ * check_run's verdict — and a red baseline or owned regression with it —
+ * before CI has reported on that head. The last observed signal carries
+ * forward unchanged; only `leftEdits` moves, since this pass may be the one
+ * whose edits CI next judges.
+ */
+export function carriedCiObservation(
+  pr: Pr,
+  prior: CiObservation | null,
+): ReturnType<typeof ciObservationFor> {
+  return prior
+    ? {
+        headSha: prior.headSha,
+        ciFailing: prior.ciFailing,
+        leftEdits: true,
+        ownedRegression: prior.ownedRegression === true,
+      }
+    : ciObservationFor(pr, { failing: false, attribution: 'unknown' });
 }
 
 export async function recallCiObservation(
